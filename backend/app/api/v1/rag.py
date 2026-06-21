@@ -89,6 +89,24 @@ def get_qa_chain() -> Any:
     return chain_factory()
 
 
+def get_rag_cache() -> Any | None:
+    """Return the optional RAG cache without making Redis a hard dependency."""
+    from app.modules.rag import retrieval_chain
+
+    factory = getattr(retrieval_chain, "get_rag_cache", None)
+    return factory() if factory is not None else None
+
+
+def _require_rag_admin(current_user: User) -> None:
+    """Restrict cache mutation to explicit admins or Scale operators."""
+    is_admin = getattr(current_user, "role", None) == "admin"
+    is_scale = (
+        getattr(current_user, "subscription_tier", None) == SubscriptionTier.SCALE
+    )
+    if not (is_admin or is_scale):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
 def _hash_question(question: str) -> str:
     """Return a SHA-256 digest for a question without exposing raw text."""
     return hashlib.sha256(question.encode("utf-8")).hexdigest()
@@ -292,6 +310,10 @@ def ingest_documents(
                 detail=f"Failed to build FAISS index: {exc}",
             )
 
+        cache = get_rag_cache()
+        if cache is not None:
+            cache.invalidate_all()
+
         index_size_bytes = 0
         for fname in ("index.faiss", "index.pkl"):
             fpath = os.path.join(settings.FAISS_INDEX_PATH, fname)
@@ -370,13 +392,34 @@ def query_knowledge_base(
 
         from app.core.database import Base
 
-        qa_chain = get_qa_chain()
         t_start = time.monotonic()
-        result = qa_chain({"query": guarded_question.question})
+        cache = get_rag_cache()
+        cached_answer = (
+            cache.get(guarded_question.question) if cache is not None else None
+        )
+        cache_hit = cached_answer is not None
+        cache_type = cached_answer.cache_type if cached_answer is not None else None
+        cache_age_seconds = cached_answer.age_seconds if cached_answer is not None else None
+
+        if cached_answer is not None:
+            result = {
+                "result": cached_answer.answer,
+                "cached_sources": cached_answer.sources,
+                "grounding_score": cached_answer.grounding_score,
+                "grounding_confidence": cached_answer.grounding_confidence,
+                "chunks_total": cached_answer.chunks_total,
+                "chunks_dropped": cached_answer.chunks_dropped,
+                "warning": cached_answer.warning,
+            }
+        else:
+            qa_chain = get_qa_chain()
+            result = qa_chain({"query": guarded_question.question})
         latency_ms = (time.monotonic() - t_start) * 1000
 
         source_docs = result.get("source_documents", [])
-        sources = [dict(getattr(doc, "metadata", {}) or {}) for doc in source_docs]
+        sources = result.get("cached_sources") or [
+            dict(getattr(doc, "metadata", {}) or {}) for doc in source_docs
+        ]
         source_labels = [str(source.get("source", "")) for source in sources]
         answer = str(result.get("result", ""))
         chunks_total = int(result.get("chunks_total", len(source_docs)))
@@ -384,6 +427,22 @@ def query_knowledge_base(
         grounding_score = float(result.get("grounding_score", 0.0))
         grounding_confidence = str(result.get("grounding_confidence", "LOW")).upper()
         warning = result.get("warning")
+
+        if not cache_hit and cache is not None and not result.get("llm_skipped", False):
+            from app.modules.rag.cache import CachedAnswer
+
+            cache.set(
+                guarded_question.question,
+                CachedAnswer(
+                    answer=answer,
+                    sources=sources,
+                    grounding_score=grounding_score,
+                    grounding_confidence=grounding_confidence,
+                    chunks_total=chunks_total,
+                    chunks_dropped=chunks_dropped,
+                    warning=warning,
+                ),
+            )
 
         if chunks_dropped:
             _log_rag_audit(
@@ -441,6 +500,8 @@ def query_knowledge_base(
                 answer=answer,
                 sources=source_labels,
                 latency_ms=latency_ms,
+                cache_hit=cache_hit,
+                cache_type=cache_type,
             )
         except Exception:
             pass
@@ -460,6 +521,9 @@ def query_knowledge_base(
             low_confidence=grounding_confidence == "LOW",
             confidence_tier=grounding_confidence.lower(),
             flagged_reason=warning,
+            cache_hit=cache_hit,
+            cache_type=cache_type,
+            cache_age_seconds=cache_age_seconds,
         )
     except HTTPException:
         raise
@@ -473,6 +537,35 @@ def query_knowledge_base(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"RAG module error: {str(exc)}",
         )
+
+
+@router.delete("/cache", tags=["RAG Intelligence"])
+def invalidate_rag_cache(
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Invalidate every exact and semantic RAG cache entry."""
+    _require_rag_admin(current_user)
+    cache = get_rag_cache()
+    return {"status": "ok", "entries_deleted": cache.invalidate_all() if cache else 0}
+
+
+@router.delete("/cache/{question_hash}", tags=["RAG Intelligence"])
+def invalidate_rag_cache_question(
+    question_hash: str,
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Invalidate one question by its SHA-256 digest."""
+    _require_rag_admin(current_user)
+    if len(question_hash) != 64 or any(
+        char not in "0123456789abcdef" for char in question_hash.lower()
+    ):
+        raise HTTPException(status_code=400, detail="Invalid SHA-256 question hash")
+    cache = get_rag_cache()
+    return {
+        "status": "ok",
+        "question_hash": question_hash.lower(),
+        "entries_deleted": cache.invalidate(question_hash.lower()) if cache else 0,
+    }
 
 
 @router.post(
